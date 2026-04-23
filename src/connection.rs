@@ -25,7 +25,9 @@ impl ConnectionManager
 
     pub fn add(&mut self, key_hash: &str, con: Connection)
     {
-        self.connections.entry(key_hash.to_string()).or_default().push(con);
+        self.connections.entry(key_hash.to_string())
+        .or_default()
+        .push(con);
     }
 
     pub fn remove(&mut self, key_hash: &str, device_id: &str)
