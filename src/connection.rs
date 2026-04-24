@@ -7,6 +7,14 @@ pub struct Connection
     pub sender: mpsc::UnboundedSender<Vec<u8>>,
 }
 
+impl Connection
+{
+    pub fn send(&self, data: Vec<u8>) -> bool
+    {
+        self.sender.send(data).is_ok()
+    }
+}
+
 pub struct ConnectionManager
 {
     connections: HashMap<String, Vec<Connection>>,
