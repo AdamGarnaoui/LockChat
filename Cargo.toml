@@ -9,7 +9,7 @@ base64 = "0.22.1"
 dashmap = "6.1.0"
 futures = "0.3.32"
 hex = "0.4.3"
-oqs = { version = "0.10", features = ["dilithium"] }
+oqs = { version = "0.10", default-features = false, features = ["dilithium"] }
 rand = "0.10.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"

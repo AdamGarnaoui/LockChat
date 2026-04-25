@@ -37,7 +37,13 @@ pub enum ServerMessage
     #[serde(rename = "delivery_status")]
     DeliveryStatus { msg_id: String, status: String },
     #[serde(rename = "message")]
-    Message { data: String },
+    Message
+    {
+        msg_id: String,
+        from: String,
+        to: String,
+        payload: String,
+    },
     #[serde(rename = "queued_messages")]
     QueuedMessages { messages: Vec<String> },
     #[serde(rename = "online_status")]
@@ -58,7 +64,6 @@ pub async fn handle_socket(
     remote_addr: String,
 )
 {
-    // check connection rate limit by IP
     if !connection_limiter.check(&remote_addr)
     {
         warn!("Connection rate limited: {}", remote_addr);
@@ -66,8 +71,6 @@ pub async fn handle_socket(
     }
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
-
-    // send challenge
 
     let challenge = generate_challenge();
     let challenge_msg = serde_json::to_string(&ServerMessage::Challenge
@@ -80,8 +83,6 @@ pub async fn handle_socket(
         warn!("Failed to send challenge");
         return;
     }
-
-    // wait for auth response with a 30 second timeout
 
     let auth_msg = match tokio::time::timeout(
         std::time::Duration::from_secs(30),
@@ -105,8 +106,6 @@ pub async fn handle_socket(
             return;
         }
     };
-
-    // verify signature
 
     match verify_auth(&challenge.nonce, &auth_response)
     {
@@ -135,28 +134,39 @@ pub async fn handle_socket(
     let key_hash = auth_response.key_hash.clone();
     let device_id = auth_response.device_id.clone();
 
-    // store public key
-
     if let Ok(pk_bytes) =
         base64::engine::general_purpose::STANDARD.decode(&auth_response.public_key)
     {
         router.store_public_key(&key_hash, pk_bytes);
     }
 
-    // register connection
-
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let conn = Connection::new(device_id.clone(), tx);
     router.register_connection(&key_hash, conn);
     info!("Authenticated: {} device: {}", key_hash, device_id);
 
-    // flush offline queue
-
     let queued = router.flush_queue(&key_hash);
     if !queued.is_empty()
     {
         let msgs: Vec<String> = queued.iter()
-            .filter_map(|m| String::from_utf8(m.clone()).ok())
+            .filter_map(|m|
+            {
+                if let Ok(envelope) = serde_json::from_slice::<Envelope>(m)
+                {
+                    let server_msg = ServerMessage::Message
+                    {
+                        msg_id: envelope.msg_id,
+                        from: envelope.from,
+                        to: envelope.to,
+                        payload: envelope.payload,
+                    };
+                    serde_json::to_string(&server_msg).ok()
+                }
+                else
+                {
+                    String::from_utf8(m.clone()).ok()
+                }
+            })
             .collect();
 
         let flush_msg = serde_json::to_string(&ServerMessage::QueuedMessages
@@ -168,15 +178,11 @@ pub async fn handle_socket(
         info!("Flushed {} queued messages to {}", msgs.len(), key_hash);
     }
 
-    // main loop
-
     let router_send = router.clone();
     let key_hash_send = key_hash.clone();
     let max_message_size = router.config.max_message_size;
     let ping_interval = router.config.ping_interval;
     let rate_limit_window = router.config.rate_limit_window_secs;
-
-    // push messages from channel to socket + ping
 
     let mut send_task = tokio::spawn(async move
     {
@@ -191,11 +197,26 @@ pub async fn handle_socket(
                     {
                         Some(data) =>
                         {
-                            let msg = ServerMessage::Message
+                            let text = if let Ok(envelope) = serde_json::from_slice::<Envelope>(&data)
                             {
-                                data: base64::engine::general_purpose::STANDARD.encode(&data),
+                                let msg = ServerMessage::Message
+                                {
+                                    msg_id: envelope.msg_id,
+                                    from: envelope.from,
+                                    to: envelope.to,
+                                    payload: envelope.payload,
+                                };
+                                serde_json::to_string(&msg).unwrap()
+                            }
+                            else
+                            {
+                                match String::from_utf8(data)
+                                {
+                                    Ok(s) => s,
+                                    Err(_) => continue,
+                                }
                             };
-                            let text = serde_json::to_string(&msg).unwrap();
+
                             if ws_sender.send(Message::Text(text.into())).await.is_err()
                             {
                                 break;
@@ -215,8 +236,6 @@ pub async fn handle_socket(
         }
     });
 
-    // receive messages from websocket and route them
-
     let mut recv_task = tokio::spawn(async move
     {
         while let Some(Ok(msg)) = ws_receiver.next().await
@@ -225,7 +244,6 @@ pub async fn handle_socket(
             {
                 Message::Text(text) =>
                 {
-                    // message size validation
                     if text.len() > max_message_size
                     {
                         let err = serde_json::to_string(&ServerMessage::Error
@@ -242,7 +260,6 @@ pub async fn handle_socket(
                         continue;
                     }
 
-                    // rate limit check
                     if !message_limiter.check(&key_hash_send)
                     {
                         let limited = serde_json::to_string(&ServerMessage::RateLimited
@@ -305,7 +322,6 @@ pub async fn handle_socket(
                             }
                             ClientMessage::ReadReceipt { msg_id, to } =>
                             {
-                                // forward read receipt to the original sender
                                 let receipt = ServerMessage::ReadReceipt
                                 {
                                     msg_id,
@@ -320,7 +336,6 @@ pub async fn handle_socket(
                                         let _ = conn.send(receipt_json.as_bytes().to_vec());
                                     }
                                 }
-                                // if recipient is offline, read receipts are not queued — they're ephemeral
                             }
                             _ => {}
                         }
@@ -333,15 +348,11 @@ pub async fn handle_socket(
         }
     });
 
-    // wait for either task to finish
-
     tokio::select!
     {
         _ = &mut send_task => recv_task.abort(),
         _ = &mut recv_task => send_task.abort(),
     }
-
-    // cleanup
 
     router.remove_connection(&key_hash, &device_id);
     info!("Disconnected: {} device: {}", key_hash, device_id);
