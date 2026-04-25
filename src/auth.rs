@@ -1,5 +1,4 @@
-use pqcrypto_dilithium::dilithium3;
-use pqcrypto_traits::sign::{PublicKey, DetachedSignature};
+use oqs::sig::{Algorithm, Sig};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::RngExt;
 use serde::{Serialize, Deserialize};
@@ -8,7 +7,7 @@ use sha2::{Sha256, Digest};
 #[derive(Serialize, Deserialize)]
 pub struct AuthChallenge
 {
-    pub nonce: String, // short for number once used
+    pub nonce: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -22,9 +21,8 @@ pub struct AuthResponse
 
 pub fn generate_challenge() -> AuthChallenge
 {
-    
     let mut nonce_bytes = [0u8; 32];
-    rand::rng().fill(&mut nonce_bytes); // why did rand change their wording
+    rand::rng().fill(&mut nonce_bytes);
 
     AuthChallenge
     {
@@ -41,33 +39,45 @@ pub fn hash_public_key(pk_bytes: &[u8]) -> String
 
 pub fn verify_auth(challenge_nonce: &str, response: &AuthResponse) -> Result<bool, String>
 {
-
     let pk_bytes = STANDARD.decode(&response.public_key)
-    .map_err(|e| format!("Invalid public key: {}", e))?;
+        .map_err(|e| format!("Invalid public key base64: {}", e))?;
 
     let sig_bytes = STANDARD.decode(&response.signature)
-    .map_err(|e| format!("Invalid signature: {}", e))?;
-
-    let pk = dilithium3::PublicKey::from_bytes(&pk_bytes)
-    .map_err(|_| "Invalid public key bytes".to_string())?;
-
-    let sig = dilithium3::DetachedSignature::from_bytes(&sig_bytes)
-    .map_err(|_| "Invalid signature bytes".to_string())?;
+        .map_err(|e| format!("Invalid signature base64: {}", e))?;
 
     let computed_hash = hash_public_key(&pk_bytes);
 
     if computed_hash != response.key_hash
     {
-        return Err("key hash mismatch".to_string());
+        return Err(format!(
+            "key hash mismatch: computed={}, received={}",
+            &computed_hash[..16], &response.key_hash[..16]
+        ));
     }
 
     let nonce_bytes = STANDARD.decode(challenge_nonce)
-    .map_err(|e| format!("Invalid nonce: {}", e))?;
+        .map_err(|e| format!("Invalid nonce base64: {}", e))?;
 
-    match dilithium3::verify_detached_signature(&sig, &nonce_bytes, &pk)
+    let sigalg = Sig::new(Algorithm::Dilithium3)
+        .map_err(|e| format!("Failed to init Dilithium3: {:?}", e))?;
+
+    let pk = sigalg.public_key_from_bytes(&pk_bytes)
+        .ok_or_else(|| format!(
+            "Invalid public key length: got {} expected {}",
+            pk_bytes.len(),
+            sigalg.length_public_key()
+        ))?;
+
+    let signature = sigalg.signature_from_bytes(&sig_bytes)
+        .ok_or_else(|| format!(
+            "Invalid signature length: got {} expected max {}",
+            sig_bytes.len(),
+            sigalg.length_signature()
+        ))?;
+
+    match sigalg.verify(&nonce_bytes, &signature, &pk)
     {
-        Ok(_) => Ok(true),
+        Ok(()) => Ok(true),
         Err(_) => Ok(false),
     }
-
 }

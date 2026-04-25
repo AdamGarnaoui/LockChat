@@ -53,6 +53,8 @@ async fn main()
 
     println!("LockChat Server Starting");
 
+    oqs::init();
+
     let config = Config::default();
     let bind_address = config.bind_address.clone();
 
@@ -79,7 +81,6 @@ async fn main()
         .route("/health", get(health))
         .with_state(state);
 
-    // clean up expired messages, persist queue, clean rate limiter every hour
     let router_cleanup = router.clone();
     let limiter_cleanup_msg = message_limiter.clone();
     let limiter_cleanup_conn = connection_limiter.clone();
@@ -107,7 +108,6 @@ async fn main()
         }
     });
 
-    // save queue on shutdown
     let router_shutdown = router.clone();
     tokio::spawn(async move
     {
