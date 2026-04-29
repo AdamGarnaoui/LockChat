@@ -49,6 +49,7 @@ async fn health() -> &'static str
 #[tokio::main]
 async fn main()
 {
+    
     tracing_subscriber::fmt::init();
 
     println!("LockChat Server Starting");
@@ -81,6 +82,17 @@ async fn main()
         .route("/health", get(health))
         .with_state(state);
 
+    let router_save = router.clone();
+    tokio::spawn(async move
+    {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop
+        {
+            interval.tick().await;
+            router_save.save_queue_if_dirty().await;
+        }
+    });
+
     let router_cleanup = router.clone();
     let limiter_cleanup_msg = message_limiter.clone();
     let limiter_cleanup_conn = connection_limiter.clone();
@@ -101,7 +113,7 @@ async fn main()
                     queue.retain(|m| !m.is_expired(604800));
                 }
             }
-            router_cleanup.save_queue();
+            router_cleanup.save_queue().await;
             limiter_cleanup_msg.cleanup();
             limiter_cleanup_conn.cleanup();
             info!("Hourly cleanup complete");
@@ -113,7 +125,7 @@ async fn main()
     {
         tokio::signal::ctrl_c().await.ok();
         info!("Shutting down, saving queue...");
-        router_shutdown.save_queue();
+        router_shutdown.save_queue().await;
         std::process::exit(0);
     });
 

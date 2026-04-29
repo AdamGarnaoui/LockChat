@@ -1,5 +1,7 @@
 use dashmap::DashMap;
 use serde::{Serialize, Deserialize};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Mutex;
 use crate::connection::Connection;
 use crate::queue::{QueuedMessage, QueueStore};
 use crate::config::Config;
@@ -26,13 +28,14 @@ pub struct Router
     pub offline_queue: DashMap<String, Vec<QueuedMessage>>,
     pub public_keys: DashMap<String, Vec<u8>>,
     pub config: Config,
+    dirty: AtomicBool,
+    save_lock: Mutex<()>,
 }
 
 impl Router
 {
     pub fn new(config: Config) -> Self
     {
-        // load persisted queue on startup
         let store = QueueStore::load("queue.dat");
         let offline_queue = DashMap::new();
         for (key, messages) in store.queues
@@ -46,6 +49,8 @@ impl Router
             offline_queue,
             public_keys: DashMap::new(),
             config,
+            dirty: AtomicBool::new(false),
+            save_lock: Mutex::new(()),
         }
     }
 
@@ -124,8 +129,7 @@ impl Router
                 msg_bytes,
             ));
 
-        // persist after queueing
-        self.save_queue();
+        self.mark_dirty();
 
         DeliveryStatus
         {
@@ -138,8 +142,7 @@ impl Router
     {
         if let Some((_, messages)) = self.offline_queue.remove(key_hash)
         {
-            // persist after flushing
-            self.save_queue();
+            self.mark_dirty();
 
             messages
                 .into_iter()
@@ -158,8 +161,24 @@ impl Router
         self.public_keys.insert(key_hash.to_string(), pk_bytes);
     }
 
-    pub fn save_queue(&self)
+    fn mark_dirty(&self)
     {
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    pub async fn save_queue_if_dirty(&self)
+    {
+        if !self.dirty.swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
+        self.save_queue().await;
+    }
+
+    pub async fn save_queue(&self)
+    {
+        let _lock = self.save_lock.lock().await;
+
         let queues: Vec<(String, Vec<QueuedMessage>)> = self.offline_queue
             .iter()
             .map(|entry| (entry.key().clone(), entry.value().iter().map(|m|

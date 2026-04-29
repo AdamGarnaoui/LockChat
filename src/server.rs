@@ -56,6 +56,12 @@ pub enum ServerMessage
     RateLimited { retry_after_secs: u64 },
 }
 
+pub enum OutboundMessage
+{
+    Raw(String),
+    Envelope(Vec<u8>),
+}
+
 pub async fn handle_socket(
     socket: WebSocket,
     router: Arc<Router>,
@@ -140,7 +146,7 @@ pub async fn handle_socket(
         router.store_public_key(&key_hash, pk_bytes);
     }
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<OutboundMessage>();
     let conn = Connection::new(device_id.clone(), tx);
     router.register_connection(&key_hash, conn);
     info!("Authenticated: {} device: {}", key_hash, device_id);
@@ -195,25 +201,32 @@ pub async fn handle_socket(
                 {
                     match data
                     {
-                        Some(data) =>
+                        Some(outbound) =>
                         {
-                            let text = if let Ok(envelope) = serde_json::from_slice::<Envelope>(&data)
+                            let text = match outbound
                             {
-                                let msg = ServerMessage::Message
+                                OutboundMessage::Raw(s) => s,
+                                OutboundMessage::Envelope(bytes) =>
                                 {
-                                    msg_id: envelope.msg_id,
-                                    from: envelope.from,
-                                    to: envelope.to,
-                                    payload: envelope.payload,
-                                };
-                                serde_json::to_string(&msg).unwrap()
-                            }
-                            else
-                            {
-                                match String::from_utf8(data)
-                                {
-                                    Ok(s) => s,
-                                    Err(_) => continue,
+                                    if let Ok(envelope) = serde_json::from_slice::<Envelope>(&bytes)
+                                    {
+                                        let msg = ServerMessage::Message
+                                        {
+                                            msg_id: envelope.msg_id,
+                                            from: envelope.from,
+                                            to: envelope.to,
+                                            payload: envelope.payload,
+                                        };
+                                        serde_json::to_string(&msg).unwrap()
+                                    }
+                                    else
+                                    {
+                                        match String::from_utf8(bytes)
+                                        {
+                                            Ok(s) => s,
+                                            Err(_) => continue,
+                                        }
+                                    }
                                 }
                             };
 
@@ -254,7 +267,7 @@ pub async fn handle_socket(
                         {
                             for conn in conns.iter()
                             {
-                                let _ = conn.send(err.as_bytes().to_vec());
+                                let _ = conn.send_raw(err.clone());
                             }
                         }
                         continue;
@@ -270,7 +283,7 @@ pub async fn handle_socket(
                         {
                             for conn in conns.iter()
                             {
-                                let _ = conn.send(limited.as_bytes().to_vec());
+                                let _ = conn.send_raw(limited.clone());
                             }
                         }
                         continue;
@@ -295,7 +308,7 @@ pub async fn handle_socket(
                                 {
                                     for conn in conns.iter()
                                     {
-                                        let _ = conn.send(status_json.as_bytes().to_vec());
+                                        let _ = conn.send_raw(status_json.clone());
                                     }
                                 }
                             }
@@ -316,7 +329,7 @@ pub async fn handle_socket(
                                 {
                                     for conn in conns.iter()
                                     {
-                                        let _ = conn.send(response_json.as_bytes().to_vec());
+                                        let _ = conn.send_raw(response_json.clone());
                                     }
                                 }
                             }
@@ -333,7 +346,7 @@ pub async fn handle_socket(
                                 {
                                     for conn in conns.iter()
                                     {
-                                        let _ = conn.send(receipt_json.as_bytes().to_vec());
+                                        let _ = conn.send_raw(receipt_json.clone());
                                     }
                                 }
                             }
