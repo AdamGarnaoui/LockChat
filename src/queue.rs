@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+﻿use std::time::{SystemTime, UNIX_EPOCH};
 use std::path::Path;
 use std::fs;
 use serde::{Serialize, Deserialize};
@@ -54,8 +54,11 @@ impl QueueStore
     {
         let data = serde_json::to_vec(self)
             .map_err(|e| format!("Failed to serialize queue: {}", e))?;
-        fs::write(path, data)
-            .map_err(|e| format!("Failed to write queue file: {}", e))?;
+        let tmp = format!("{}.tmp", path);
+        fs::write(&tmp, &data)
+            .map_err(|e| format!("Failed to write temp queue file: {}", e))?;
+        fs::rename(&tmp, path)
+            .map_err(|e| format!("Failed to rename queue file: {}", e))?;
         Ok(())
     }
 

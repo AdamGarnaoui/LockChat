@@ -1,6 +1,6 @@
 use oqs::sig::{Algorithm, Sig};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use rand::RngExt;
+use rand::Rng;
 use serde::{Serialize, Deserialize};
 use sha2::{Sha256, Digest};
 
@@ -39,6 +39,11 @@ pub fn hash_public_key(pk_bytes: &[u8]) -> String
 
 pub fn verify_auth(challenge_nonce: &str, response: &AuthResponse) -> Result<bool, String>
 {
+    if response.key_hash.len() != 64 || !response.key_hash.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err("Invalid key hash format".to_string());
+    }
+
     let pk_bytes = STANDARD.decode(&response.public_key)
         .map_err(|e| format!("Invalid public key base64: {}", e))?;
 
@@ -49,9 +54,12 @@ pub fn verify_auth(challenge_nonce: &str, response: &AuthResponse) -> Result<boo
 
     if computed_hash != response.key_hash
     {
+        let computed_prefix: String = computed_hash.chars().take(16).collect();
+        let received_prefix: String = response.key_hash.chars().take(16).collect();
+
         return Err(format!(
             "key hash mismatch: computed={}, received={}",
-            &computed_hash[..16], &response.key_hash[..16]
+            computed_prefix, received_prefix
         ));
     }
 

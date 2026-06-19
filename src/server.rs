@@ -1,4 +1,4 @@
-use crate::auth::{generate_challenge, verify_auth, AuthResponse};
+﻿use crate::auth::{generate_challenge, verify_auth, AuthResponse};
 use crate::connection::Connection;
 use crate::ratelimit::RateLimiter;
 use crate::router::{Envelope, Router};
@@ -62,6 +62,23 @@ pub enum OutboundMessage
     Envelope(Vec<u8>),
 }
 
+fn to_json(message: &ServerMessage) -> Option<String>
+{
+    serde_json::to_string(message).ok()
+}
+
+fn short_id(value: &str) -> String
+{
+    value.chars().take(12).collect()
+}
+
+fn valid_device_id(device_id: &str, max_len: usize) -> bool
+{
+    !device_id.is_empty()
+        && device_id.len() <= max_len
+        && device_id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 pub async fn handle_socket(
     socket: WebSocket,
     router: Arc<Router>,
@@ -79,10 +96,14 @@ pub async fn handle_socket(
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
     let challenge = generate_challenge();
-    let challenge_msg = serde_json::to_string(&ServerMessage::Challenge
+    let challenge_msg = match to_json(&ServerMessage::Challenge
     {
         nonce: challenge.nonce.clone(),
-    }).unwrap();
+    })
+    {
+        Some(msg) => msg,
+        None => return,
+    };
 
     if ws_sender.send(Message::Text(challenge_msg.into())).await.is_err()
     {
@@ -115,24 +136,18 @@ pub async fn handle_socket(
 
     match verify_auth(&challenge.nonce, &auth_response)
     {
-        Ok(true) =>
-        {
-            let result = serde_json::to_string(&ServerMessage::AuthResult
-            {
-                success: true,
-                error: None,
-            }).unwrap();
-            let _ = ws_sender.send(Message::Text(result.into())).await;
-        }
+        Ok(true) => {}
         _ =>
         {
-            let result = serde_json::to_string(&ServerMessage::AuthResult
+            if let Some(result) = to_json(&ServerMessage::AuthResult
             {
                 success: false,
                 error: Some("Authentication failed".to_string()),
-            }).unwrap();
-            let _ = ws_sender.send(Message::Text(result.into())).await;
-            warn!("Auth failed for {}", auth_response.key_hash);
+            })
+            {
+                let _ = ws_sender.send(Message::Text(result.into())).await;
+            }
+            warn!("Auth failed for {}", short_id(&auth_response.key_hash));
             return;
         }
     }
@@ -140,16 +155,67 @@ pub async fn handle_socket(
     let key_hash = auth_response.key_hash.clone();
     let device_id = auth_response.device_id.clone();
 
-    if let Ok(pk_bytes) =
-        base64::engine::general_purpose::STANDARD.decode(&auth_response.public_key)
+    if !valid_device_id(&device_id, router.config.max_device_id_len)
     {
-        router.store_public_key(&key_hash, pk_bytes);
+        if let Some(result) = to_json(&ServerMessage::AuthResult
+        {
+            success: false,
+            error: Some("Invalid device id".to_string()),
+        })
+        {
+            let _ = ws_sender.send(Message::Text(result.into())).await;
+        }
+        return;
     }
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<OutboundMessage>();
+    let pk_bytes = match base64::engine::general_purpose::STANDARD.decode(&auth_response.public_key)
+    {
+        Ok(pk_bytes) => pk_bytes,
+        Err(_) =>
+        {
+            if let Some(result) = to_json(&ServerMessage::AuthResult
+            {
+                success: false,
+                error: Some("Invalid public key".to_string()),
+            })
+            {
+                let _ = ws_sender.send(Message::Text(result.into())).await;
+            }
+            return;
+        }
+    };
+
+    if let Err(err) = router.validate_and_store_public_key(&key_hash, pk_bytes).await
+    {
+        if let Some(result) = to_json(&ServerMessage::AuthResult
+        {
+            success: false,
+            error: Some(err),
+        })
+        {
+            let _ = ws_sender.send(Message::Text(result.into())).await;
+        }
+        return;
+    }
+
+    if let Some(result) = to_json(&ServerMessage::AuthResult
+    {
+        success: true,
+        error: None,
+    })
+    {
+        let _ = ws_sender.send(Message::Text(result.into())).await;
+    }
+    else
+    {
+        return;
+    }
+
+    let (tx, mut rx) = mpsc::channel::<OutboundMessage>(256);
+    let self_tx = tx.clone();
     let conn = Connection::new(device_id.clone(), tx);
     router.register_connection(&key_hash, conn);
-    info!("Authenticated: {} device: {}", key_hash, device_id);
+    info!("Authenticated: {} device: {}", short_id(&key_hash), device_id);
 
     let queued = router.flush_queue(&key_hash);
     if !queued.is_empty()
@@ -166,7 +232,7 @@ pub async fn handle_socket(
                         to: envelope.to,
                         payload: envelope.payload,
                     };
-                    serde_json::to_string(&server_msg).ok()
+                    to_json(&server_msg)
                 }
                 else
                 {
@@ -175,13 +241,15 @@ pub async fn handle_socket(
             })
             .collect();
 
-        let flush_msg = serde_json::to_string(&ServerMessage::QueuedMessages
+        if let Some(flush_msg) = to_json(&ServerMessage::QueuedMessages
         {
             messages: msgs.clone(),
-        }).unwrap();
+        })
+        {
+            let _ = ws_sender.send(Message::Text(flush_msg.into())).await;
+        }
 
-        let _ = ws_sender.send(Message::Text(flush_msg.into())).await;
-        info!("Flushed {} queued messages to {}", msgs.len(), key_hash);
+        info!("Flushed {} queued messages to {}", msgs.len(), short_id(&key_hash));
     }
 
     let router_send = router.clone();
@@ -217,7 +285,11 @@ pub async fn handle_socket(
                                             to: envelope.to,
                                             payload: envelope.payload,
                                         };
-                                        serde_json::to_string(&msg).unwrap()
+                                        match to_json(&msg)
+                                        {
+                                            Some(json) => json,
+                                            None => continue,
+                                        }
                                     }
                                     else
                                     {
@@ -259,89 +331,107 @@ pub async fn handle_socket(
                 {
                     if text.len() > max_message_size
                     {
-                        let err = serde_json::to_string(&ServerMessage::Error
+                        if let Some(err) = to_json(&ServerMessage::Error
                         {
                             message: "Message too large".to_string(),
-                        }).unwrap();
-                        if let Some(conns) = router_send.connections.get(&key_hash_send)
+                        })
                         {
-                            for conn in conns.iter()
-                            {
-                                let _ = conn.send_raw(err.clone());
-                            }
+                            let _ = self_tx.try_send(OutboundMessage::Raw(err));
                         }
                         continue;
                     }
 
                     if !message_limiter.check(&key_hash_send)
                     {
-                        let limited = serde_json::to_string(&ServerMessage::RateLimited
+                        if let Some(limited) = to_json(&ServerMessage::RateLimited
                         {
                             retry_after_secs: rate_limit_window,
-                        }).unwrap();
-                        if let Some(conns) = router_send.connections.get(&key_hash_send)
+                        })
                         {
-                            for conn in conns.iter()
-                            {
-                                let _ = conn.send_raw(limited.clone());
-                            }
+                            let _ = self_tx.try_send(OutboundMessage::Raw(limited));
                         }
                         continue;
                     }
 
-                    if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text)
+                    let client_msg = match serde_json::from_str::<ClientMessage>(&text)
                     {
-                        match client_msg
+                        Ok(client_msg) => client_msg,
+                        Err(_) =>
                         {
-                            ClientMessage::Send(envelope) =>
+                            if let Some(err) = to_json(&ServerMessage::Error
                             {
-                                let status = router_send.route_message(&envelope);
+                                message: "Malformed message".to_string(),
+                            })
+                            {
+                                let _ = self_tx.try_send(OutboundMessage::Raw(err));
+                            }
+                            continue;
+                        }
+                    };
 
-                                let delivery = ServerMessage::DeliveryStatus
+                    match client_msg
+                    {
+                        ClientMessage::Send(envelope) =>
+                        {
+                            if envelope.from != key_hash_send
+                            {
+                                if let Some(err) = to_json(&ServerMessage::Error
                                 {
-                                    msg_id: status.msg_id,
-                                    status: status.status,
-                                };
-                                let status_json = serde_json::to_string(&delivery).unwrap();
-
-                                if let Some(conns) = router_send.connections.get(&key_hash_send)
+                                    message: "Invalid sender".to_string(),
+                                })
                                 {
-                                    for conn in conns.iter()
-                                    {
-                                        let _ = conn.send_raw(status_json.clone());
-                                    }
+                                    let _ = self_tx.try_send(OutboundMessage::Raw(err));
                                 }
+                                continue;
                             }
-                            ClientMessage::DeliveryStatus { msg_id, status } =>
-                            {
-                                info!("Delivery status received: {} - {}", msg_id, status);
-                            }
-                            ClientMessage::IsOnline { key_hash } =>
-                            {
-                                let online = router_send.is_online(&key_hash);
-                                let response = ServerMessage::OnlineStatus
-                                {
-                                    key_hash,
-                                    online,
-                                };
-                                let response_json = serde_json::to_string(&response).unwrap();
-                                if let Some(conns) = router_send.connections.get(&key_hash_send)
-                                {
-                                    for conn in conns.iter()
-                                    {
-                                        let _ = conn.send_raw(response_json.clone());
-                                    }
-                                }
-                            }
-                            ClientMessage::ReadReceipt { msg_id, to } =>
-                            {
-                                let receipt = ServerMessage::ReadReceipt
-                                {
-                                    msg_id,
-                                    from: key_hash_send.clone(),
-                                };
-                                let receipt_json = serde_json::to_string(&receipt).unwrap();
 
+                            let status = router_send.route_message(&envelope);
+
+                            if let Some(status_json) = to_json(&ServerMessage::DeliveryStatus
+                            {
+                                msg_id: status.msg_id,
+                                status: status.status,
+                            })
+                            {
+                                let _ = self_tx.try_send(OutboundMessage::Raw(status_json));
+                            }
+                        }
+                        ClientMessage::DeliveryStatus { msg_id, status } =>
+                        {
+                            info!("Delivery status received: {} - {}", msg_id, status);
+                        }
+                        ClientMessage::IsOnline { key_hash } =>
+                        {
+                            let online = router_send.is_online(&key_hash);
+                            if let Some(response_json) = to_json(&ServerMessage::OnlineStatus
+                            {
+                                key_hash,
+                                online,
+                            })
+                            {
+                                let _ = self_tx.try_send(OutboundMessage::Raw(response_json));
+                            }
+                        }
+                        ClientMessage::ReadReceipt { msg_id, to } =>
+                        {
+                            if !router_send.validate_read_receipt(&msg_id, &key_hash_send, &to)
+                            {
+                                if let Some(err) = to_json(&ServerMessage::Error
+                                {
+                                    message: "Invalid read receipt".to_string(),
+                                })
+                                {
+                                    let _ = self_tx.try_send(OutboundMessage::Raw(err));
+                                }
+                                continue;
+                            }
+
+                            if let Some(receipt_json) = to_json(&ServerMessage::ReadReceipt
+                            {
+                                msg_id,
+                                from: key_hash_send.clone(),
+                            })
+                            {
                                 if let Some(conns) = router_send.connections.get(&to)
                                 {
                                     for conn in conns.iter()
@@ -350,8 +440,8 @@ pub async fn handle_socket(
                                     }
                                 }
                             }
-                            _ => {}
                         }
+                        _ => {}
                     }
                 }
                 Message::Pong(_) => {}
@@ -368,5 +458,5 @@ pub async fn handle_socket(
     }
 
     router.remove_connection(&key_hash, &device_id);
-    info!("Disconnected: {} device: {}", key_hash, device_id);
+    info!("Disconnected: {} device: {}", short_id(&key_hash), device_id);
 }

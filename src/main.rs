@@ -1,4 +1,4 @@
-mod auth;
+﻿mod auth;
 mod config;
 mod connection;
 mod queue;
@@ -10,6 +10,7 @@ use axum::{extract::State, routing::get, Router as AxumRouter};
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::ConnectInfo;
 use axum::response::IntoResponse;
+use axum_server::tls_rustls::RustlsConfig;
 use config::Config;
 use ratelimit::RateLimiter;
 use router::Router;
@@ -49,7 +50,6 @@ async fn health() -> &'static str
 #[tokio::main]
 async fn main()
 {
-    
     tracing_subscriber::fmt::init();
 
     println!("LockChat Server Starting");
@@ -102,17 +102,7 @@ async fn main()
         loop
         {
             interval.tick().await;
-            let keys: Vec<String> = router_cleanup.offline_queue
-                .iter()
-                .map(|r| r.key().clone())
-                .collect();
-            for key in keys
-            {
-                if let Some(mut queue) = router_cleanup.offline_queue.get_mut(&key)
-                {
-                    queue.retain(|m| !m.is_expired(604800));
-                }
-            }
+            router_cleanup.cleanup_expired();
             router_cleanup.save_queue().await;
             limiter_cleanup_msg.cleanup();
             limiter_cleanup_conn.cleanup();
@@ -129,7 +119,15 @@ async fn main()
         std::process::exit(0);
     });
 
+    let tls_cert_path = std::env::var("LOCKCHAT_TLS_CERT").unwrap();
+    let tls_key_path = std::env::var("LOCKCHAT_TLS_KEY").unwrap();
+    let tls_config = RustlsConfig::from_pem_file(tls_cert_path, tls_key_path).await.unwrap();
+
     info!("LockChat server on {}", bind_address);
-    let listener = tokio::net::TcpListener::bind(&bind_address).await.unwrap();
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+    let addr: SocketAddr = bind_address.parse().unwrap();
+
+    axum_server::bind_rustls(addr, tls_config)
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+        .unwrap();
 }
